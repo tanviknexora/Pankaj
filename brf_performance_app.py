@@ -41,6 +41,10 @@ CUSTOM_CSS = """
         border-radius: 8px;
     }
     div[data-testid="stMetricValue"] { font-size: 1.6rem; }
+    /* Give charts breathing room from the tab bar above them so a
+       previous tab's chart title can never visually bleed through. */
+    div[data-testid="stTabs"] { margin-top: 6px; }
+    div[data-testid="stTabs"] div[data-baseweb="tab-panel"] { padding-top: 14px; }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -55,14 +59,12 @@ REQUIRED_BRF_COLS = ["Referrer Client ID", "Client Id", "Referred User Created A
 
 @st.cache_data(show_spinner=False)
 def load_user_data(file_bytes: bytes) -> pd.DataFrame:
-    df = pd.read_excel(io.BytesIO(file_bytes))
-    return df
+    return pd.read_excel(io.BytesIO(file_bytes))
 
 
 @st.cache_data(show_spinner=False)
 def load_brf_data(file_bytes: bytes) -> pd.DataFrame:
-    df = pd.read_csv(io.BytesIO(file_bytes))
-    return df
+    return pd.read_csv(io.BytesIO(file_bytes))
 
 
 def parse_referred_date(series: pd.Series) -> pd.Series:
@@ -76,14 +78,18 @@ def parse_referred_date(series: pd.Series) -> pd.Series:
 
 
 @st.cache_data(show_spinner=False)
-def process(user_bytes: bytes, brf_bytes: bytes):
+def build_merged(user_bytes: bytes, brf_bytes: bytes):
+    """Load, validate, and merge the two files. Returns the merged raw
+    frame (unfiltered) plus any missing-column errors. Aggregation is
+    intentionally kept out of this cached step so sidebar filters can be
+    applied cheaply afterwards without re-reading/re-merging the files."""
     user_data = load_user_data(user_bytes)
     brf = load_brf_data(brf_bytes)
 
     missing_user = [c for c in REQUIRED_USER_COLS if c not in user_data.columns]
     missing_brf = [c for c in REQUIRED_BRF_COLS if c not in brf.columns]
     if missing_user or missing_brf:
-        return None, None, None, missing_user, missing_brf
+        return None, missing_user, missing_brf
 
     user_data = user_data[REQUIRED_USER_COLS].copy()
     brf = brf[REQUIRED_BRF_COLS].copy()
@@ -91,11 +97,19 @@ def process(user_bytes: bytes, brf_bytes: bytes):
     brf["Referred User Created At Parsed"] = parse_referred_date(brf["Referred User Created At"])
     brf["Month"] = brf["Referred User Created At Parsed"].dt.strftime("%Y-%m")
     brf["Date"] = brf["Referred User Created At Parsed"].dt.strftime("%Y-%m-%d")
+    # Week bucket (Monday-start) for a less cluttered daily view
+    brf["Week"] = brf["Referred User Created At Parsed"].dt.to_period("W-SUN").apply(
+        lambda p: p.start_time.strftime("%Y-%m-%d") if pd.notna(p) else None
+    )
 
     merged = pd.merge(user_data, brf, on="Client Id", how="inner")
+    return merged, [], []
 
-    # Monthly aggregation
-    g = merged.groupby("Month", as_index=False)
+
+def aggregate(merged: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    if merged.empty:
+        return pd.DataFrame(columns=[group_col, "Ib_Children", "Deposited", "deposit%", "Trade_Count", "trade%"])
+    g = merged.groupby(group_col, as_index=False)
     agg = g.agg(
         Ib_Children=("Client Id", "count"),
         Deposited=("Total Deposit", lambda x: (x > 0).sum()),
@@ -103,20 +117,7 @@ def process(user_bytes: bytes, brf_bytes: bytes):
     ).astype({"Ib_Children": int, "Deposited": int, "Trade_Count": int})
     agg["deposit%"] = round(agg["Deposited"] / agg["Ib_Children"].replace(0, np.nan) * 100, 2)
     agg["trade%"] = round(agg["Trade_Count"] / agg["Deposited"].replace(0, np.nan) * 100, 2)
-    result_monthly = agg[["Month", "Ib_Children", "Deposited", "deposit%", "Trade_Count", "trade%"]].sort_values("Month")
-
-    # Daily aggregation
-    d = merged.groupby("Date", as_index=False)
-    agg_1 = d.agg(
-        Ib_Children=("Client Id", "count"),
-        Deposited=("Total Deposit", lambda x: (x > 0).sum()),
-        Trade_Count=("Last Transaction", lambda x: x.notna().sum()),
-    )
-    agg_1["deposit%"] = round(agg_1["Deposited"] / agg_1["Ib_Children"].replace(0, np.nan) * 100, 2)
-    agg_1["trade%"] = round(agg_1["Trade_Count"] / agg_1["Deposited"].replace(0, np.nan) * 100, 2)
-    result_daily = agg_1[["Date", "Ib_Children", "Deposited", "deposit%", "Trade_Count", "trade%"]].sort_values("Date")
-
-    return merged, result_monthly, result_daily, [], []
+    return agg[[group_col, "Ib_Children", "Deposited", "deposit%", "Trade_Count", "trade%"]].sort_values(group_col)
 
 
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -124,7 +125,6 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 
 def kpi_delta(series: pd.Series):
-    """Return (latest value, delta vs previous period) for a numeric series."""
     if len(series) == 0:
         return None, None
     latest = series.iloc[-1]
@@ -152,9 +152,6 @@ brf_file = st.sidebar.file_uploader(
          "Client Id, Referred User Created At",
 )
 
-st.sidebar.divider()
-st.sidebar.caption("Built for Nexora BRF / IB-children performance tracking.")
-
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
@@ -165,10 +162,8 @@ if not user_file or not brf_file:
     st.info("👈 Upload both the **User Data (.xlsx)** and **Broker Referrals (.csv)** files in the sidebar to get started.")
     st.stop()
 
-with st.spinner("Merging and crunching numbers..."):
-    merged, result_monthly, result_daily, missing_user, missing_brf = process(
-        user_file.getvalue(), brf_file.getvalue()
-    )
+with st.spinner("Merging files..."):
+    merged_raw, missing_user, missing_brf = build_merged(user_file.getvalue(), brf_file.getvalue())
 
 if missing_user or missing_brf:
     if missing_user:
@@ -177,9 +172,49 @@ if missing_user or missing_brf:
         st.error(f"Broker Referrals file is missing required column(s): {', '.join(missing_brf)}")
     st.stop()
 
-if merged.empty:
+if merged_raw.empty:
     st.warning("No matching Client Ids found between the two files after the merge. Double-check the uploads.")
     st.stop()
+
+# ----------------------------------------------------------------------
+# Sidebar — filters (Referrer / Child Client Id)
+# ----------------------------------------------------------------------
+st.sidebar.divider()
+st.sidebar.subheader("🔎 Filters")
+
+referrer_options = sorted(merged_raw["Referrer Client ID"].dropna().unique().tolist())
+child_options = sorted(merged_raw["Client Id"].dropna().unique().tolist())
+
+selected_referrers = st.sidebar.multiselect(
+    "Referrer Client ID",
+    options=referrer_options,
+    default=[],
+    help="Leave empty to include all referrers.",
+)
+selected_children = st.sidebar.multiselect(
+    "Client Id (child)",
+    options=child_options,
+    default=[],
+    help="Leave empty to include all referred children.",
+)
+
+merged = merged_raw.copy()
+if selected_referrers:
+    merged = merged[merged["Referrer Client ID"].isin(selected_referrers)]
+if selected_children:
+    merged = merged[merged["Client Id"].isin(selected_children)]
+
+st.sidebar.caption(f"Showing **{merged['Client Id'].nunique():,}** of {merged_raw['Client Id'].nunique():,} children.")
+st.sidebar.divider()
+st.sidebar.caption("Built for Nexora BRF / IB-children performance tracking.")
+
+if merged.empty:
+    st.warning("No rows match the current filters. Try clearing the Referrer / Client Id filters in the sidebar.")
+    st.stop()
+
+result_monthly = aggregate(merged, "Month")
+result_daily = aggregate(merged, "Date")
+result_weekly = aggregate(merged, "Week")
 
 # ----------------------------------------------------------------------
 # KPI row
@@ -224,39 +259,35 @@ st.divider()
 # ----------------------------------------------------------------------
 # Trend charts
 # ----------------------------------------------------------------------
-tab_monthly, tab_daily = st.tabs(["📅 Monthly Trends", "📆 Daily Trends"])
+tab_monthly, tab_daily = st.tabs(["📅 Monthly Trends", "📆 Daily / Weekly Trends"])
 
 with tab_monthly:
-    c1, c2 = st.columns(2)
+    st.subheader("New IB Children vs Deposited (Monthly)")
+    fig = go.Figure()
+    fig.add_bar(x=result_monthly["Month"], y=result_monthly["Ib_Children"], name="IB Children", marker_color="#6C8EF5")
+    fig.add_bar(x=result_monthly["Month"], y=result_monthly["Deposited"], name="Deposited", marker_color="#38C793")
+    fig.update_layout(
+        barmode="group", xaxis_title="Month", yaxis_title="Count",
+        legend=dict(orientation="h", y=1.12), margin=dict(t=20, b=20),
+    )
+    st.plotly_chart(fig, use_container_width=True, key="monthly_bar_chart")
 
-    with c1:
-        fig = go.Figure()
-        fig.add_bar(x=result_monthly["Month"], y=result_monthly["Ib_Children"], name="IB Children", marker_color="#6C8EF5")
-        fig.add_bar(x=result_monthly["Month"], y=result_monthly["Deposited"], name="Deposited", marker_color="#38C793")
-        fig.update_layout(
-            barmode="group", title="New IB Children vs Deposited (Monthly)",
-            xaxis_title="Month", yaxis_title="Count", legend=dict(orientation="h", y=1.15),
-            margin=dict(t=60, b=20),
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    st.subheader("Deposit % & Trade % Trend (Monthly)")
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(x=result_monthly["Month"], y=result_monthly["deposit%"],
+                               mode="lines+markers", name="Deposit %", line=dict(color="#38C793", width=3)))
+    fig2.add_trace(go.Scatter(x=result_monthly["Month"], y=result_monthly["trade%"],
+                               mode="lines+markers", name="Trade %", line=dict(color="#F5A623", width=3)))
+    fig2.update_layout(
+        xaxis_title="Month", yaxis_title="%",
+        legend=dict(orientation="h", y=1.12), margin=dict(t=20, b=20),
+    )
+    st.plotly_chart(fig2, use_container_width=True, key="monthly_pct_chart")
 
-    with c2:
-        fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(x=result_monthly["Month"], y=result_monthly["deposit%"],
-                                   mode="lines+markers", name="Deposit %", line=dict(color="#38C793", width=3)))
-        fig2.add_trace(go.Scatter(x=result_monthly["Month"], y=result_monthly["trade%"],
-                                   mode="lines+markers", name="Trade %", line=dict(color="#F5A623", width=3)))
-        fig2.update_layout(
-            title="Deposit % & Trade % Trend (Monthly)",
-            xaxis_title="Month", yaxis_title="%", legend=dict(orientation="h", y=1.15),
-            margin=dict(t=60, b=20),
-        )
-        st.plotly_chart(fig2, use_container_width=True)
-
-    fig3 = px.bar(result_monthly, x="Month", y="Trade_Count", title="Trade Count (Monthly)",
-                   color_discrete_sequence=["#6C8EF5"])
-    fig3.update_layout(margin=dict(t=60, b=20))
-    st.plotly_chart(fig3, use_container_width=True)
+    st.subheader("Trade Count (Monthly)")
+    fig3 = px.bar(result_monthly, x="Month", y="Trade_Count", color_discrete_sequence=["#6C8EF5"])
+    fig3.update_layout(margin=dict(t=20, b=20), xaxis_title="Month", yaxis_title="Trade Count")
+    st.plotly_chart(fig3, use_container_width=True, key="monthly_trade_count_chart")
 
     st.subheader("Monthly Result Table")
     st.dataframe(result_monthly, use_container_width=True, hide_index=True)
@@ -265,44 +296,66 @@ with tab_monthly:
         data=df_to_csv_bytes(result_monthly),
         file_name="brf_monthly_performance.csv",
         mime="text/csv",
+        key="monthly_download",
     )
 
 with tab_daily:
-    c1, c2 = st.columns(2)
+    granularity = st.radio(
+        "Granularity", ["Daily", "Weekly"], horizontal=True,
+        help="Weekly rolls the daily figures up by ISO week (Mon–Sun) — much easier to read over a long date range.",
+        key="daily_granularity",
+    )
+    view_df, x_col = (result_daily, "Date") if granularity == "Daily" else (result_weekly, "Week")
 
-    with c1:
-        fig4 = go.Figure()
-        fig4.add_trace(go.Scatter(x=result_daily["Date"], y=result_daily["Ib_Children"],
-                                   mode="lines", name="IB Children", line=dict(color="#6C8EF5", width=2)))
-        fig4.add_trace(go.Scatter(x=result_daily["Date"], y=result_daily["Deposited"],
-                                   mode="lines", name="Deposited", line=dict(color="#38C793", width=2)))
-        fig4.update_layout(
-            title="New IB Children vs Deposited (Daily)",
-            xaxis_title="Date", yaxis_title="Count", legend=dict(orientation="h", y=1.15),
-            margin=dict(t=60, b=20),
+    if granularity == "Daily" and len(view_df) > 1:
+        dates_sorted = sorted(pd.to_datetime(view_df["Date"]).unique())
+        min_d, max_d = dates_sorted[0].date(), dates_sorted[-1].date()
+        date_range = st.slider(
+            "Date range", min_value=min_d, max_value=max_d, value=(min_d, max_d),
+            format="YYYY-MM-DD", key="daily_date_range",
         )
-        st.plotly_chart(fig4, use_container_width=True)
+        mask = (pd.to_datetime(view_df["Date"]).dt.date >= date_range[0]) & \
+               (pd.to_datetime(view_df["Date"]).dt.date <= date_range[1])
+        view_df = view_df[mask]
 
-    with c2:
-        fig5 = go.Figure()
-        fig5.add_trace(go.Scatter(x=result_daily["Date"], y=result_daily["deposit%"],
-                                   mode="lines", name="Deposit %", line=dict(color="#38C793", width=2)))
-        fig5.add_trace(go.Scatter(x=result_daily["Date"], y=result_daily["trade%"],
-                                   mode="lines", name="Trade %", line=dict(color="#F5A623", width=2)))
-        fig5.update_layout(
-            title="Deposit % & Trade % Trend (Daily)",
-            xaxis_title="Date", yaxis_title="%", legend=dict(orientation="h", y=1.15),
-            margin=dict(t=60, b=20),
-        )
-        st.plotly_chart(fig5, use_container_width=True)
+    st.subheader(f"New IB Children vs Deposited ({granularity})")
+    fig4 = go.Figure()
+    fig4.add_trace(go.Scatter(x=view_df[x_col], y=view_df["Ib_Children"],
+                               mode="lines+markers", name="IB Children",
+                               line=dict(color="#6C8EF5", width=2), marker=dict(size=5)))
+    fig4.add_trace(go.Scatter(x=view_df[x_col], y=view_df["Deposited"],
+                               mode="lines+markers", name="Deposited",
+                               line=dict(color="#38C793", width=2), marker=dict(size=5)))
+    fig4.update_layout(
+        xaxis_title=x_col, yaxis_title="Count",
+        legend=dict(orientation="h", y=1.12), margin=dict(t=20, b=20),
+        xaxis=dict(rangeslider=dict(visible=True), type="date"),
+    )
+    st.plotly_chart(fig4, use_container_width=True, key="daily_count_chart")
 
-    st.subheader("Daily Result Table")
-    st.dataframe(result_daily, use_container_width=True, hide_index=True)
+    st.subheader(f"Deposit % & Trade % Trend ({granularity})")
+    fig5 = go.Figure()
+    fig5.add_trace(go.Scatter(x=view_df[x_col], y=view_df["deposit%"],
+                               mode="lines+markers", name="Deposit %",
+                               line=dict(color="#38C793", width=2), marker=dict(size=5)))
+    fig5.add_trace(go.Scatter(x=view_df[x_col], y=view_df["trade%"],
+                               mode="lines+markers", name="Trade %",
+                               line=dict(color="#F5A623", width=2), marker=dict(size=5)))
+    fig5.update_layout(
+        xaxis_title=x_col, yaxis_title="%",
+        legend=dict(orientation="h", y=1.12), margin=dict(t=20, b=20),
+        xaxis=dict(rangeslider=dict(visible=True), type="date"),
+    )
+    st.plotly_chart(fig5, use_container_width=True, key="daily_pct_chart")
+
+    st.subheader(f"{granularity} Result Table")
+    st.dataframe(view_df, use_container_width=True, hide_index=True)
     st.download_button(
-        "⬇️ Download Daily Table (CSV)",
-        data=df_to_csv_bytes(result_daily),
-        file_name="brf_daily_performance.csv",
+        f"⬇️ Download {granularity} Table (CSV)",
+        data=df_to_csv_bytes(view_df),
+        file_name=f"brf_{granularity.lower()}_performance.csv",
         mime="text/csv",
+        key="daily_download",
     )
 
 st.divider()
@@ -313,4 +366,5 @@ with st.expander("🔍 View merged raw data (User Data ⋈ BRF)"):
         data=df_to_csv_bytes(merged),
         file_name="brf_merged_raw.csv",
         mime="text/csv",
+        key="raw_download",
     )
