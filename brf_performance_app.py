@@ -4,8 +4,9 @@ BRF Referral Performance Dashboard
 Upload three files:
   1. User Data export (.xlsx)          — Client Id, Total Deposit, First Deposit,
                                           Last Transaction, Trade Dates
-  2. Broker Referrals export (.csv)    — Referrer Client ID, Client Id,
-                                          Referred User Created At
+  2. Broker Referrals export (.csv)    — Broker Client ID, Referred User Client ID,
+                                          Referred User Created At (Broker Name optional,
+                                          used for nicer referrer labels if present)
   3. Trading Customers export (.csv)   — Name, Client ID, Status, Manager,
                                           First Trade, Referred By
 
@@ -66,7 +67,13 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # Helpers
 # ----------------------------------------------------------------------
 REQUIRED_USER_COLS = ["Client Id", "Total Deposit", "First Deposit", "Last Transaction", "Trade Dates"]
-REQUIRED_BRF_COLS = ["Referrer Client ID", "Client Id", "Referred User Created At"]
+# Real export header is: Broker ID, Broker Name, Broker Client ID, Broker Referral Code,
+# Broker Referral Count, Referred User ID, Referred User Name, Referred User Client ID,
+# Referred User Status, Referred User Balance, Referred User Created At.
+# Only these three are required; "Broker Name" is picked up if present (for nicer labels)
+# but the app doesn't hard-fail without it.
+REQUIRED_BRF_COLS = ["Broker Client ID", "Referred User Client ID", "Referred User Created At"]
+OPTIONAL_BRF_COLS = ["Broker Name"]
 REQUIRED_CUSTOMERS_COLS = ["Name", "Client ID", "Status", "Manager", "First Trade", "Referred By"]
 DEFAULT_PULLBACK_MANAGERS = {"parth", "swathi", "rajinder"}
 
@@ -111,7 +118,17 @@ def build_merged(user_bytes: bytes, brf_bytes: bytes):
         return None, missing_user, missing_brf
 
     user_data = user_data[REQUIRED_USER_COLS].copy()
-    brf = brf[REQUIRED_BRF_COLS].copy()
+
+    brf_cols = REQUIRED_BRF_COLS + [c for c in OPTIONAL_BRF_COLS if c in brf.columns]
+    brf = brf[brf_cols].copy()
+    brf = brf.rename(columns={
+        "Broker Client ID": "Referrer Client ID",
+        "Referred User Client ID": "Client Id",
+        "Broker Name": "Referrer Name",
+    })
+    if "Referrer Name" not in brf.columns:
+        # Older exports without a Broker Name column — fall back to the ID itself.
+        brf["Referrer Name"] = brf["Referrer Client ID"]
 
     brf["Referred User Created At Parsed"] = parse_referred_date(brf["Referred User Created At"])
     brf["Month"] = brf["Referred User Created At Parsed"].dt.strftime("%Y-%m")
@@ -259,8 +276,9 @@ user_file = st.sidebar.file_uploader(
 brf_file = st.sidebar.file_uploader(
     "Broker Referrals export (.csv)",
     type=["csv"],
-    help="e.g. brokers-with-referrals.csv — must contain Referrer Client ID, "
-         "Client Id, Referred User Created At",
+    help="e.g. brokers-with-referrals.csv — must contain Broker Client ID, "
+         "Referred User Client ID, Referred User Created At (Broker Name is "
+         "optional but gives nicer referrer labels if present)",
 )
 customers_file = st.sidebar.file_uploader(
     "Trading Customers export (.csv)",
@@ -272,7 +290,7 @@ customers_file = st.sidebar.file_uploader(
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
-st.title("📊 BRF Referral Performance Dashboard")
+st.title("BRF Referral Performance Dashboard")
 st.caption("Track IB-children onboarding, deposit conversion, and trade activation — monthly & daily.")
 
 if not user_file or not brf_file or not customers_file:
@@ -308,12 +326,18 @@ st.sidebar.divider()
 st.sidebar.subheader("🔎 Filters")
 
 referrer_options = sorted(merged_raw["Referrer Client ID"].dropna().unique().tolist())
+referrer_name_map = (
+    merged_raw.drop_duplicates(subset=["Referrer Client ID"])
+    .set_index("Referrer Client ID")["Referrer Name"]
+    .to_dict()
+)
 child_options = sorted(merged_raw["Client Id"].dropna().unique().tolist())
 
 selected_referrers = st.sidebar.multiselect(
     "Referrer Client ID",
     options=referrer_options,
     default=[],
+    format_func=lambda rid: f"{referrer_name_map.get(rid, rid)} ({rid})",
     help="Leave empty to include all referrers.",
 )
 selected_children = st.sidebar.multiselect(
