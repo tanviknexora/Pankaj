@@ -105,17 +105,22 @@ def parse_referred_date(series: pd.Series) -> pd.Series:
 
 @st.cache_data(show_spinner=False)
 def build_merged(user_bytes: bytes, brf_bytes: bytes):
-    """Load, validate, and merge the two files. Returns the merged raw
-    frame (unfiltered) plus any missing-column errors. Aggregation is
-    intentionally kept out of this cached step so sidebar filters can be
-    applied cheaply afterwards without re-reading/re-merging the files."""
+    """Load, validate, and merge the two files. Returns:
+      - merged: User Data ⋈ Broker Referrals (inner join) — the basis for
+        IB-children deposit/trade performance.
+      - brf_clean: the cleaned Broker Referrals file on its own, BEFORE the
+        merge — the basis for broker-file / coverage stats, since a broker's
+        referral still counts toward "brokers in the file" even if that
+        referred client never shows up in User_Data.
+    Aggregation is intentionally kept out of this cached step so sidebar
+    filters can be applied cheaply afterwards without re-reading/re-merging."""
     user_data = load_user_data(user_bytes)
     brf = load_brf_data(brf_bytes)
 
     missing_user = [c for c in REQUIRED_USER_COLS if c not in user_data.columns]
     missing_brf = [c for c in REQUIRED_BRF_COLS if c not in brf.columns]
     if missing_user or missing_brf:
-        return None, missing_user, missing_brf
+        return None, None, missing_user, missing_brf
 
     user_data = user_data[REQUIRED_USER_COLS].copy()
 
@@ -139,7 +144,7 @@ def build_merged(user_bytes: bytes, brf_bytes: bytes):
     )
 
     merged = pd.merge(user_data, brf, on="Client Id", how="inner")
-    return merged, [], []
+    return merged, brf, [], []
 
 
 @st.cache_data(show_spinner=False)
@@ -205,15 +210,18 @@ def aggregate_referrals(customers: pd.DataFrame, group_col: str) -> pd.DataFrame
     return pivot[cols].sort_values(group_col)
 
 
-def aggregate_brokers(merged: pd.DataFrame, group_col: str) -> pd.DataFrame:
-    """Count of distinct brokers (Referrer Client ID) who were active in
-    each period, bucketed by the same Referred User Created At-derived
-    Month/Date/Week used everywhere else — i.e. 'brokers at the time'."""
+def aggregate_brokers(brf_frame: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    """Count of distinct brokers (Referrer Client ID) active in each period,
+    bucketed by the same Referred User Created At-derived Month/Date/Week
+    used everywhere else. Takes the Broker Referral file directly (not the
+    IB-performance merge), so a broker still counts even if their referred
+    client never made it into User_Data."""
     cols = [group_col, "Total Brokers"]
-    if merged.empty:
+    if brf_frame.empty:
         return pd.DataFrame(columns=cols)
-    g = merged.groupby(group_col)["Referrer Client ID"].nunique().reset_index(name="Total Brokers")
+    g = brf_frame.groupby(group_col)["Referrer Client ID"].nunique().reset_index(name="Total Brokers")
     return g[cols].sort_values(group_col)
+
 
 
 def combine_frames(base: pd.DataFrame, referrals: pd.DataFrame, brokers: pd.DataFrame, group_col: str) -> pd.DataFrame:
@@ -290,7 +298,7 @@ customers_file = st.sidebar.file_uploader(
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
-st.title("BRF Referral Performance Dashboard")
+st.title("📊 BRF Referral Performance Dashboard")
 st.caption("Track IB-children onboarding, deposit conversion, and trade activation — monthly & daily.")
 
 if not user_file or not brf_file or not customers_file:
@@ -299,7 +307,7 @@ if not user_file or not brf_file or not customers_file:
     st.stop()
 
 with st.spinner("Merging files..."):
-    merged_raw, missing_user, missing_brf = build_merged(user_file.getvalue(), brf_file.getvalue())
+    merged_raw, brf_clean_raw, missing_user, missing_brf = build_merged(user_file.getvalue(), brf_file.getvalue())
     customers_raw, missing_customers = build_customers(customers_file.getvalue())
 
 if missing_user or missing_brf or missing_customers:
@@ -325,9 +333,9 @@ if customers_raw.empty:
 st.sidebar.divider()
 st.sidebar.subheader("🔎 Filters")
 
-referrer_options = sorted(merged_raw["Referrer Client ID"].dropna().unique().tolist())
+referrer_options = sorted(brf_clean_raw["Referrer Client ID"].dropna().unique().tolist())
 referrer_name_map = (
-    merged_raw.drop_duplicates(subset=["Referrer Client ID"])
+    brf_clean_raw.drop_duplicates(subset=["Referrer Client ID"])
     .set_index("Referrer Client ID")["Referrer Name"]
     .to_dict()
 )
@@ -353,9 +361,19 @@ if selected_referrers:
 if selected_children:
     merged = merged[merged["Client Id"].isin(selected_children)]
 
+# The Broker Referral file, filtered the same way, kept separate from `merged`
+# (the IB-performance join) — this is the basis for the broker-file / coverage
+# stats, so a broker still counts even if their referred client never made it
+# into User_Data.
+brf_clean = brf_clean_raw.copy()
+if selected_referrers:
+    brf_clean = brf_clean[brf_clean["Referrer Client ID"].isin(selected_referrers)]
+if selected_children:
+    brf_clean = brf_clean[brf_clean["Client Id"].isin(selected_children)]
+
 st.sidebar.caption(
-    f"Showing **{merged['Client Id'].nunique():,}** of {merged_raw['Client Id'].nunique():,} children · "
-    f"**{merged['Referrer Client ID'].nunique():,}** of {merged_raw['Referrer Client ID'].nunique():,} brokers."
+    f"Showing **{merged['Client Id'].nunique():,}** of {merged_raw['Client Id'].nunique():,} children matched to IB performance · "
+    f"**{brf_clean['Referrer Client ID'].nunique():,}** of {brf_clean_raw['Referrer Client ID'].nunique():,} brokers in the referral file."
 )
 
 if merged.empty:
@@ -387,9 +405,11 @@ customers_typed["Type"] = customers_typed["Manager"].isin(pullback_managers).map
 
 # Apply the same Referrer / Client Id filters to the Trading Customers data.
 # The CRM export has no Referrer column of its own, so map child -> referrer
-# via the (unfiltered) BRF data first.
+# via the (unfiltered) Broker Referral file first — the full file, not the
+# IB-performance merge, so a referrer mapping still exists even for children
+# who never made it into User_Data.
 referrer_lookup = (
-    merged_raw.drop_duplicates(subset=["Client Id"]).set_index("Client Id")["Referrer Client ID"]
+    brf_clean_raw.drop_duplicates(subset=["Client Id"]).set_index("Client Id")["Referrer Client ID"]
 )
 customers_filtered = customers_typed.copy()
 if selected_children:
@@ -400,30 +420,37 @@ if selected_referrers:
 
 # ----------------------------------------------------------------------
 # Build the combined Month / Date / Week tables:
-# BRF+User_Data performance  ⋈  CRM referral counts (Pullback/Sales)  ⋈  broker activity
+# BRF+User_Data performance  ⋈  CRM referral counts (Pullback/Sales)  ⋈  broker-file activity
 # ----------------------------------------------------------------------
 result_monthly = combine_frames(
     aggregate(merged, "Month"),
     aggregate_referrals(customers_filtered, "Month"),
-    aggregate_brokers(merged, "Month"),
+    aggregate_brokers(brf_clean, "Month"),
     "Month",
 )
 result_daily = combine_frames(
     aggregate(merged, "Date"),
     aggregate_referrals(customers_filtered, "Date"),
-    aggregate_brokers(merged, "Date"),
+    aggregate_brokers(brf_clean, "Date"),
     "Date",
 )
 result_weekly = combine_frames(
     aggregate(merged, "Week"),
     aggregate_referrals(customers_filtered, "Week"),
-    aggregate_brokers(merged, "Week"),
+    aggregate_brokers(brf_clean, "Week"),
     "Week",
 )
 
 # ----------------------------------------------------------------------
-# KPI row
+# KPI dashboard — three separate, clearly-labeled sections so IB
+# performance, team/CRM referral performance, and broker-file coverage
+# never get visually mixed together.
 # ----------------------------------------------------------------------
+
+# --- Section 1: IB Children Performance (User Data ⋈ Broker Referrals) ---
+st.subheader("📊 IB Children Performance")
+st.caption("From User Data ⋈ Broker Referrals — deposit and trade activation of referred children.")
+
 total_children = int(merged["Client Id"].nunique())
 total_deposited = int((merged["Total Deposit"] > 0).sum())
 total_traded = int(merged["Last Transaction"].notna().sum())
@@ -435,11 +462,28 @@ latest_month_dep_pct, delta_dep_pct = kpi_delta(result_monthly["deposit%"])
 latest_month_trade_pct, delta_trade_pct = kpi_delta(result_monthly["trade%"])
 
 k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Total IB Children", f"{total_children:,}")
-k2.metric("Deposited", f"{total_deposited:,}", help="Clients with Total Deposit > 0")
-k3.metric("Overall Deposit %", f"{overall_deposit_pct}%")
-k4.metric("Traded (of Deposited)", f"{total_traded:,}")
-k5.metric("Overall Trade %", f"{overall_trade_pct}%")
+k1.metric(
+    "Total IB Children", f"{total_children:,}",
+    help="merged['Client Id'].nunique() — distinct referred children present in both "
+         "User Data and Broker Referrals (after sidebar filters).",
+)
+k2.metric(
+    "Deposited", f"{total_deposited:,}",
+    help="Count of those children with Total Deposit > 0.",
+)
+k3.metric(
+    "Overall Deposit %", f"{overall_deposit_pct}%",
+    help="Deposited ÷ Total IB Children × 100.",
+)
+k4.metric(
+    "Traded (of Deposited)", f"{total_traded:,}",
+    help="Count of children with a non-null Last Transaction — note this is measured "
+         "across ALL children, not only the deposited ones.",
+)
+k5.metric(
+    "Overall Trade %", f"{overall_trade_pct}%",
+    help="Traded ÷ Deposited × 100 (NOT ÷ Total IB Children).",
+)
 
 st.markdown("")
 k6, k7, k8 = st.columns(3)
@@ -447,42 +491,84 @@ k6.metric(
     "Latest Month — New Children",
     f"{int(latest_month_children):,}" if latest_month_children is not None else "—",
     delta=f"{int(delta_children):+,}" if delta_children is not None else None,
+    help="Ib_Children from the most recent row of the Monthly table; delta vs. the prior month.",
 )
 k7.metric(
     "Latest Month — Deposit %",
     f"{latest_month_dep_pct}%" if latest_month_dep_pct is not None else "—",
     delta=f"{delta_dep_pct:+}%" if delta_dep_pct is not None else None,
+    help="deposit% from the most recent month; delta vs. the prior month.",
 )
 k8.metric(
     "Latest Month — Trade %",
     f"{latest_month_trade_pct}%" if latest_month_trade_pct is not None else "—",
     delta=f"{delta_trade_pct:+}%" if delta_trade_pct is not None else None,
+    help="trade% from the most recent month; delta vs. the prior month.",
 )
 
-st.markdown("")
+st.divider()
+
+# --- Section 2: Team Referral Performance (Trading Customers CRM) ---
+st.subheader("🧑‍💼 Team Referral Performance")
+st.caption("From the Trading Customers (CRM) export only — Pullback vs. Sales, independent of IB deposit/trade data.")
+
 total_referrals_overall = int(customers_filtered["Client ID"].nunique())
 total_pullback_overall = int((customers_filtered["Type"] == "Pullback").sum())
 total_sales_overall = int((customers_filtered["Type"] == "Sales").sum())
 overall_pullback_pct = round(total_pullback_overall / total_referrals_overall * 100, 2) if total_referrals_overall else 0
 overall_sales_pct = round(total_sales_overall / total_referrals_overall * 100, 2) if total_referrals_overall else 0
-total_brokers_overall = int(merged["Referrer Client ID"].nunique())
 
 k9, k10, k11, k12 = st.columns(4)
 k9.metric(
     "Total Referrals (CRM)", f"{total_referrals_overall:,}",
-    help="Trading Customers rows with a non-empty 'Referred By', after Referrer/Client Id filters.",
+    help="Trading Customers rows with a non-empty 'Referred By' (after filters). "
+         "This is the CRM's own count — independent of whether BRF/User_Data have caught up.",
 )
 k10.metric(
-    "Total Brokers", f"{total_brokers_overall:,}",
-    help="Unique Referrer Client IDs active over the current filtered date range.",
+    "Pullback Referrals", f"{total_pullback_overall:,}",
+    help="Of the Total Referrals above, those whose Manager is in the Pullback list (sidebar).",
 )
 k11.metric(
     "Pullback %", f"{overall_pullback_pct}%",
-    help=f"{total_pullback_overall:,} of {total_referrals_overall:,} referrals",
+    help=f"Pullback Referrals ÷ Total Referrals × 100 — {total_pullback_overall:,} of {total_referrals_overall:,}.",
 )
 k12.metric(
     "Sales %", f"{overall_sales_pct}%",
-    help=f"{total_sales_overall:,} of {total_referrals_overall:,} referrals",
+    help=f"Sales Referrals ÷ Total Referrals × 100 — {total_sales_overall:,} of {total_referrals_overall:,}.",
+)
+
+st.divider()
+
+# --- Section 3: Broker File Coverage (Broker Referral file vs. CRM Total Referrals) ---
+st.subheader("🔗 Broker File Coverage")
+st.caption("How many brokers/referrals the Broker Referral file itself contains, and how that compares to the CRM's Total Referrals — no deposit/trade or team-split numbers here.")
+
+total_distinct_brokers = int(brf_clean["Referrer Client ID"].nunique())
+broker_file_referrals = int(brf_clean["Client Id"].nunique())
+coverage_pct = round(broker_file_referrals / total_referrals_overall * 100, 2) if total_referrals_overall else 0
+
+k13, k14, k15, k16 = st.columns(4)
+k13.metric(
+    "Total Distinct Brokers", f"{total_distinct_brokers:,}",
+    help="brf_clean['Referrer Client ID'].nunique() — every unique broker in the Broker "
+         "Referral file (after filters), regardless of whether their referred client "
+         "appears in User_Data.",
+)
+k14.metric(
+    "Broker File Referrals", f"{broker_file_referrals:,}",
+    help="brf_clean['Client Id'].nunique() — distinct referred clients logged in the "
+         "Broker Referral file.",
+)
+k15.metric(
+    "Total Referrals (CRM)", f"{total_referrals_overall:,}",
+    help="Same figure as in the Team Referral Performance section above, repeated here "
+         "for direct comparison against the Broker Referral file.",
+)
+k16.metric(
+    "Broker File Coverage %", f"{coverage_pct}%",
+    help=f"Broker File Referrals ÷ Total Referrals (CRM) × 100 — {broker_file_referrals:,} "
+         f"of {total_referrals_overall:,}. Below 100% means the CRM has referrals the "
+         f"broker file hasn't caught up to yet (or vice versa if over 100%).",
 )
 
 st.divider()
@@ -591,6 +677,7 @@ with tab_daily:
 
 with tab_team:
     st.subheader("Referrals by Team vs. Broker Activity")
+    st.caption("Pullback/Sales bars are from the Trading Customers CRM export; the Total Brokers line is from the Broker Referral file itself.")
     team_granularity = st.radio(
         "Granularity", ["Monthly", "Weekly", "Daily"], horizontal=True, key="team_granularity",
     )
@@ -683,4 +770,14 @@ with st.expander("🔍 View filtered Trading Customers data (CRM referrals)"):
         file_name="brf_trading_customers_filtered.csv",
         mime="text/csv",
         key="customers_download",
+    )
+
+with st.expander("🔍 View filtered Broker Referral file (broker-file coverage source)"):
+    st.dataframe(brf_clean, use_container_width=True)
+    st.download_button(
+        "⬇️ Download Broker Referral Data (CSV)",
+        data=df_to_csv_bytes(brf_clean),
+        file_name="brf_broker_file_filtered.csv",
+        mime="text/csv",
+        key="brf_download",
     )
