@@ -355,11 +355,60 @@ selected_children = st.sidebar.multiselect(
     help="Leave empty to include all referred children.",
 )
 
+# ----------------------------------------------------------------------
+# Sidebar — date range (applies to every table, chart, and KPI below)
+# ----------------------------------------------------------------------
+st.sidebar.divider()
+st.sidebar.subheader("📅 Date Range")
+
+all_dates = pd.to_datetime(
+    pd.concat([merged_raw["Date"], brf_clean_raw["Date"], customers_raw["Date"]], ignore_index=True),
+    errors="coerce",
+).dropna()
+
+if not all_dates.empty:
+    min_date, max_date = all_dates.min().date(), all_dates.max().date()
+    date_range = st.sidebar.date_input(
+        "Filter by date",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+        help="Filters everything below by its underlying date — Referred User Created At "
+             "for IB Performance / Broker File Coverage, First Trade for Team Referral "
+             "Performance. Applies to the KPIs, all three trend tabs, and the raw-data "
+             "downloads at the bottom.",
+    )
+    # st.date_input can momentarily return a single date while the user is still
+    # picking the second end of the range — fall back to the full span in that case.
+    if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
+        start_date, end_date = date_range
+    else:
+        start_date, end_date = min_date, max_date
+else:
+    start_date, end_date = None, None
+
+st.sidebar.caption(
+    f"{start_date:%b %d, %Y} → {end_date:%b %d, %Y}" if start_date and end_date else "No dated rows found."
+)
+
+
+def filter_by_date(df: pd.DataFrame, date_col: str = "Date") -> pd.DataFrame:
+    """Restrict a frame to the sidebar's selected date range, on its own
+    Date column (Referred User Created At for merged/brf_clean, First
+    Trade for customers)."""
+    if start_date is None or end_date is None or df.empty or date_col not in df.columns:
+        return df
+    parsed = pd.to_datetime(df[date_col], errors="coerce")
+    mask = (parsed.dt.date >= start_date) & (parsed.dt.date <= end_date)
+    return df[mask]
+
+
 merged = merged_raw.copy()
 if selected_referrers:
     merged = merged[merged["Referrer Client ID"].isin(selected_referrers)]
 if selected_children:
     merged = merged[merged["Client Id"].isin(selected_children)]
+merged = filter_by_date(merged)
 
 # The Broker Referral file, filtered the same way, kept separate from `merged`
 # (the IB-performance join) — this is the basis for the broker-file / coverage
@@ -370,6 +419,7 @@ if selected_referrers:
     brf_clean = brf_clean[brf_clean["Referrer Client ID"].isin(selected_referrers)]
 if selected_children:
     brf_clean = brf_clean[brf_clean["Client Id"].isin(selected_children)]
+brf_clean = filter_by_date(brf_clean)
 
 st.sidebar.caption(
     f"Showing **{merged['Client Id'].nunique():,}** of {merged_raw['Client Id'].nunique():,} children matched to IB performance · "
@@ -377,7 +427,7 @@ st.sidebar.caption(
 )
 
 if merged.empty:
-    st.warning("No rows match the current filters. Try clearing the Referrer / Client Id filters in the sidebar.")
+    st.warning("No rows match the current filters. Try widening the date range or clearing the Referrer / Client Id filters in the sidebar.")
     st.stop()
 
 # ----------------------------------------------------------------------
@@ -417,6 +467,7 @@ if selected_children:
 if selected_referrers:
     mapped_referrer = customers_filtered["Client ID"].map(referrer_lookup)
     customers_filtered = customers_filtered[mapped_referrer.isin(selected_referrers)]
+customers_filtered = filter_by_date(customers_filtered)
 
 # ----------------------------------------------------------------------
 # Build the combined Month / Date / Week tables:
