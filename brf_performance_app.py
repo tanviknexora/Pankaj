@@ -340,7 +340,13 @@ k11.metric(
 )
 
 with st.expander("🩺 Why is Total IB Children so much smaller than the broker file's referral count?"):
-    unmatched_ids = sorted(set(brf_filtered["Client Id"]) - set(merged_raw["Client Id"]))
+    # Convert to plain strings and drop true nulls before the set difference —
+    # a stray NaN/non-string value mixed in with strings makes sorted() raise
+    # a TypeError ('<' not supported between instances of 'float' and 'str'),
+    # so this is done defensively regardless of what's actually in the data.
+    brf_client_ids = {str(x) for x in brf_filtered["Client Id"].dropna()}
+    merged_client_ids = {str(x) for x in merged_raw["Client Id"].dropna()}
+    unmatched_ids = sorted(brf_client_ids - merged_client_ids)
     st.write(
         f"**{total_broker_file_referrals:,}** distinct clients were referred according to the "
         f"Broker Referral file, but only **{total_children:,}** of them also have a row in "
