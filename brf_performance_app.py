@@ -34,7 +34,7 @@ import streamlit as st
 # ----------------------------------------------------------------------
 st.set_page_config(
     page_title="BRF Referral Performance",
-    page_icon="",
+    page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -231,7 +231,7 @@ brf_file = st.sidebar.file_uploader(
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
-st.title("BRF Referral Performance Dashboard")
+st.title("📊 BRF Referral Performance Dashboard")
 st.caption("Track IB-children onboarding, deposit conversion, and trade activation — monthly & daily.")
 
 if not user_file or not brf_file:
