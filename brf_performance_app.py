@@ -125,9 +125,13 @@ def build_merged(user_bytes: bytes, brf_bytes: bytes):
     missing_user = [c for c in REQUIRED_USER_COLS if c not in user_data.columns]
     missing_brf = [c for c in REQUIRED_BRF_COLS if c not in brf.columns]
     if missing_user or missing_brf:
-        return None, missing_user, missing_brf
+        return None, None, missing_user, missing_brf
 
     user_data = user_data[REQUIRED_USER_COLS].copy()
+    # Defensive normalization: trim stray whitespace on the join key so an
+    # otherwise-matching Client Id (e.g. "A201974" vs "A201974 ") doesn't
+    # silently fail to match and get miscounted as "never joined User_Data".
+    user_data["Client Id"] = user_data["Client Id"].astype(str).str.strip()
 
     brf_cols = REQUIRED_BRF_COLS + [c for c in OPTIONAL_BRF_COLS if c in brf.columns]
     brf = brf[brf_cols].copy()
@@ -136,6 +140,7 @@ def build_merged(user_bytes: bytes, brf_bytes: bytes):
         "Referred User Client ID": "Client Id",
         "Broker Name": "Referrer Name",
     })
+    brf["Client Id"] = brf["Client Id"].astype(str).str.strip()
 
     brf["Referred User Created At Parsed"] = parse_referred_date(brf["Referred User Created At"])
     brf["Month"] = brf["Referred User Created At Parsed"].dt.strftime("%Y-%m")
@@ -146,7 +151,7 @@ def build_merged(user_bytes: bytes, brf_bytes: bytes):
     )
 
     merged = pd.merge(user_data, brf, on="Client Id", how="inner")
-    return merged, [], []
+    return merged, brf, [], []
 
 
 def aggregate(merged: pd.DataFrame, group_col: str) -> pd.DataFrame:
@@ -206,7 +211,7 @@ if not user_file or not brf_file:
     st.stop()
 
 with st.spinner("Merging files..."):
-    merged_raw, missing_user, missing_brf = build_merged(user_file.getvalue(), brf_file.getvalue())
+    merged_raw, brf_raw, missing_user, missing_brf = build_merged(user_file.getvalue(), brf_file.getvalue())
 
 if missing_user or missing_brf:
     if missing_user:
@@ -225,7 +230,7 @@ if merged_raw.empty:
 st.sidebar.divider()
 st.sidebar.subheader("🔎 Filters")
 
-referrer_options = sorted(merged_raw["Referrer Client ID"].dropna().unique().tolist())
+referrer_options = sorted(brf_raw["Referrer Client ID"].dropna().unique().tolist())
 child_options = sorted(merged_raw["Client Id"].dropna().unique().tolist())
 
 selected_referrers = st.sidebar.multiselect(
@@ -247,7 +252,20 @@ if selected_referrers:
 if selected_children:
     merged = merged[merged["Client Id"].isin(selected_children)]
 
-st.sidebar.caption(f"Showing **{merged['Client Id'].nunique():,}** of {merged_raw['Client Id'].nunique():,} children.")
+# The Broker Referral file, filtered the same way but kept separate from
+# `merged` — this is the true broker-file count (e.g. 414 distinct brokers,
+# 2,857 referred clients), independent of whether a referred client also
+# has a row in User_Data.
+brf_filtered = brf_raw.copy()
+if selected_referrers:
+    brf_filtered = brf_filtered[brf_filtered["Referrer Client ID"].isin(selected_referrers)]
+if selected_children:
+    brf_filtered = brf_filtered[brf_filtered["Client Id"].isin(selected_children)]
+
+st.sidebar.caption(
+    f"Showing **{merged['Client Id'].nunique():,}** of {merged_raw['Client Id'].nunique():,} children matched to User_Data · "
+    f"**{brf_filtered['Referrer Client ID'].nunique():,}** of {brf_raw['Referrer Client ID'].nunique():,} brokers in the referral file."
+)
 st.sidebar.divider()
 st.sidebar.caption("Built for Nexora BRF / IB-children performance tracking.")
 
@@ -296,6 +314,50 @@ k8.metric(
     f"{latest_month_trade_pct}%" if latest_month_trade_pct is not None else "—",
     delta=f"{delta_trade_pct:+}%" if delta_trade_pct is not None else None,
 )
+
+st.markdown("")
+total_distinct_brokers = int(brf_filtered["Referrer Client ID"].nunique())
+total_broker_file_referrals = int(brf_filtered["Client Id"].nunique())
+match_rate_pct = round(total_children / total_broker_file_referrals * 100, 2) if total_broker_file_referrals else 0
+
+k9, k10, k11 = st.columns(3)
+k9.metric(
+    "Total Distinct Brokers", f"{total_distinct_brokers:,}",
+    help="Unique Referrer Client IDs in the Broker Referral file itself (after filters) — "
+         "not limited to brokers whose referred children also appear in User_Data.",
+)
+k10.metric(
+    "Broker File Referrals", f"{total_broker_file_referrals:,}",
+    help="Unique referred Client IDs logged in the Broker Referral file — this is the "
+         "true total, independent of whether they show up in User_Data.",
+)
+k11.metric(
+    "Matched to User_Data %", f"{match_rate_pct}%",
+    help=f"Total IB Children ÷ Broker File Referrals × 100 — {total_children:,} of "
+         f"{total_broker_file_referrals:,}. This is why 'Total IB Children' above can be "
+         f"much smaller than the broker file's own referral count: only referred clients "
+         f"that also appear in User_Data count as IB Children.",
+)
+
+with st.expander("🩺 Why is Total IB Children so much smaller than the broker file's referral count?"):
+    unmatched_ids = sorted(set(brf_filtered["Client Id"]) - set(merged_raw["Client Id"]))
+    st.write(
+        f"**{total_broker_file_referrals:,}** distinct clients were referred according to the "
+        f"Broker Referral file, but only **{total_children:,}** of them also have a row in "
+        f"User_Data — so **{len(unmatched_ids):,}** referred clients never matched."
+    )
+    st.caption(
+        "If this gap looks too large to be real (e.g. you'd expect most referred clients to "
+        "eventually show up in User_Data), it's worth double-checking these IDs against "
+        "User_Data by hand — a subtle formatting difference (extra characters, a different "
+        "ID scheme) between the two exports would show up exactly like this. Whitespace is "
+        "already stripped from both files' Client Id columns before matching, so that "
+        "specific issue is ruled out."
+    )
+    st.dataframe(
+        pd.DataFrame({"Unmatched Client Id (in Broker Referral file, not in User_Data)": unmatched_ids}).head(50),
+        use_container_width=True, hide_index=True,
+    )
 
 st.divider()
 
