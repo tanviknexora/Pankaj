@@ -87,13 +87,48 @@ def load_brf_data(file_bytes: bytes) -> pd.DataFrame:
 
 
 def parse_referred_date(series: pd.Series) -> pd.Series:
-    """Try the expected dd/mm/yyyy HH:MM format first, fall back to a
-    flexible parse so the app doesn't hard-fail on slightly different
-    export formats."""
-    parsed = pd.to_datetime(series, format="%d/%m/%Y %H:%M", errors="coerce")
-    if parsed.isna().mean() > 0.3:  # format guess was probably wrong
-        parsed = pd.to_datetime(series, errors="coerce", dayfirst=True)
-    return parsed
+    """Try known 'Referred User Created At' export formats explicitly, in
+    order, and use whichever matches the most rows. Explicit formats never
+    guess which number is the day vs. the month, so this is safe even when
+    day and month are both <=12 (the classic ambiguous case).
+
+    Two real export formats have been seen in practice:
+      - "2026-09-05 11:11:27"  (ISO, ...-%m-%d %H:%M:%S)
+      - "03/09/2026 18:20"     (dd/mm/yyyy %H:%M)
+
+    IMPORTANT: the old fallback used to call pd.to_datetime(..., dayfirst=True)
+    with no explicit format. dayfirst=True forces a day/month swap on ANY
+    ambiguous pair of numbers -- including in an otherwise-unambiguous ISO
+    "YYYY-MM-DD" string, e.g. it silently turns 2026-09-05 into 2026-05-09.
+    That bug is why Month/Date/Week buckets could come out completely wrong
+    without a single row failing to parse. Only as an absolute last resort
+    (no explicit format reaches even 50% match) do we fall back to a plain,
+    non-dayfirst flexible parse, which is far safer for ISO-like input.
+    """
+    candidate_formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+    ]
+    best_parsed, best_score = None, -1.0
+    for fmt in candidate_formats:
+        parsed = pd.to_datetime(series, format=fmt, errors="coerce")
+        score = parsed.notna().mean()
+        if score > best_score:
+            best_parsed, best_score = parsed, score
+        if score >= 0.98:
+            break
+
+    if best_score < 0.5:
+        # None of the known formats matched well — fall back to a flexible
+        # parse WITHOUT forcing dayfirst, so unambiguous ISO input still
+        # parses correctly; only genuinely ambiguous dd/mm-vs-mm/dd strings
+        # are at any risk here, not the common ISO case.
+        best_parsed = pd.to_datetime(series, errors="coerce")
+    return best_parsed
 
 
 @st.cache_data(show_spinner=False)
@@ -253,7 +288,37 @@ if merged_raw.empty:
     st.stop()
 
 # ----------------------------------------------------------------------
-# Sidebar — filters (Referrer / Child Client Id)
+# Date-parsing diagnostics — helps confirm whether Month/Date/Week buckets
+# (all derived from "Referred User Created At") are being parsed correctly,
+# rather than guessing at it.
+# ----------------------------------------------------------------------
+with st.expander("🩺 Date Parsing Check — verify Referred User Created At is being read correctly"):
+    total_rows = len(brf_clean_raw)
+    unparsed_mask = brf_clean_raw["Referred User Created At Parsed"].isna()
+    unparsed_count = int(unparsed_mask.sum())
+
+    if unparsed_count:
+        st.warning(
+            f"{unparsed_count:,} of {total_rows:,} rows in the Broker Referral file could not be "
+            f"parsed as a date at all, and are dropped from every Month/Date/Week table."
+        )
+        st.dataframe(
+            brf_clean_raw.loc[unparsed_mask, ["Referrer Name", "Referrer Client ID", "Client Id", "Referred User Created At"]].head(10),
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        st.success(f"All {total_rows:,} rows parsed to a date.")
+
+    st.caption(
+        "Below: the raw 'Referred User Created At' string next to what it was parsed into, "
+        "for the 5 earliest and 5 latest rows by parsed date. If the parsed year/month "
+        "looks off compared to the raw string, that's the bug to fix."
+    )
+    parsed_ok = brf_clean_raw.loc[~unparsed_mask, ["Referred User Created At", "Referred User Created At Parsed"]].sort_values("Referred User Created At Parsed")
+    preview = pd.concat([parsed_ok.head(5), parsed_ok.tail(5)]).drop_duplicates()
+    st.dataframe(preview, use_container_width=True, hide_index=True)
+
+
 # ----------------------------------------------------------------------
 st.sidebar.divider()
 st.sidebar.subheader("🔎 Filters")
