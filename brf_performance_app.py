@@ -154,15 +154,35 @@ def build_merged(user_bytes: bytes, brf_bytes: bytes):
     return merged, brf, [], []
 
 
-def aggregate(merged: pd.DataFrame, group_col: str) -> pd.DataFrame:
+def aggregate(brf_filtered: pd.DataFrame, merged: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    """Ib_Children is the TRUE referred-child count for each Month/Date/Week,
+    taken straight from the Broker Referral file — NOT restricted to only
+    those who also matched into User_Data. Deposited/Trade_Count can only
+    ever be computed from User_Data (that's the only place deposit/trade
+    figures exist), so those still come from `merged`; deposit%/trade% are
+    then computed against the TRUE Ib_Children total, not a matched-only
+    subset, so they're not artificially inflated."""
+    cols = [group_col, "Ib_Children", "Deposited", "deposit%", "Trade_Count", "trade%"]
+    if brf_filtered.empty:
+        return pd.DataFrame(columns=cols)
+
+    total_children = (
+        brf_filtered.groupby(group_col, as_index=False)["Client Id"]
+        .nunique()
+        .rename(columns={"Client Id": "Ib_Children"})
+    )
+
     if merged.empty:
-        return pd.DataFrame(columns=[group_col, "Ib_Children", "Deposited", "deposit%", "Trade_Count", "trade%"])
-    g = merged.groupby(group_col, as_index=False)
-    agg = g.agg(
-        Ib_Children=("Client Id", "count"),
-        Deposited=("Total Deposit", lambda x: (x > 0).sum()),
-        Trade_Count=("Last Transaction", lambda x: x.notna().sum()),
-    ).astype({"Ib_Children": int, "Deposited": int, "Trade_Count": int})
+        perf = pd.DataFrame(columns=[group_col, "Deposited", "Trade_Count"])
+    else:
+        perf = merged.groupby(group_col, as_index=False).agg(
+            Deposited=("Total Deposit", lambda x: (x > 0).sum()),
+            Trade_Count=("Last Transaction", lambda x: x.notna().sum()),
+        )
+
+    agg = pd.merge(total_children, perf, on=group_col, how="left")
+    for col in ["Ib_Children", "Deposited", "Trade_Count"]:
+        agg[col] = agg[col].fillna(0).astype(int)
     agg["deposit%"] = round(agg["Deposited"] / agg["Ib_Children"].replace(0, np.nan) * 100, 2)
     agg["trade%"] = round(agg["Trade_Count"] / agg["Deposited"].replace(0, np.nan) * 100, 2)
     return agg[[group_col, "Ib_Children", "Deposited", "deposit%", "Trade_Count", "trade%"]].sort_values(group_col)
@@ -273,14 +293,14 @@ if merged.empty:
     st.warning("No rows match the current filters. Try clearing the Referrer / Client Id filters in the sidebar.")
     st.stop()
 
-result_monthly = aggregate(merged, "Month")
-result_daily = aggregate(merged, "Date")
-result_weekly = aggregate(merged, "Week")
+result_monthly = aggregate(brf_filtered, merged, "Month")
+result_daily = aggregate(brf_filtered, merged, "Date")
+result_weekly = aggregate(brf_filtered, merged, "Week")
 
 # ----------------------------------------------------------------------
 # KPI row
 # ----------------------------------------------------------------------
-total_children = int(merged["Client Id"].nunique())
+total_children = int(brf_filtered["Client Id"].nunique())
 total_deposited = int((merged["Total Deposit"] > 0).sum())
 total_traded = int(merged["Last Transaction"].notna().sum())
 overall_deposit_pct = round(total_deposited / total_children * 100, 2) if total_children else 0
@@ -291,9 +311,21 @@ latest_month_dep_pct, delta_dep_pct = kpi_delta(result_monthly["deposit%"])
 latest_month_trade_pct, delta_trade_pct = kpi_delta(result_monthly["trade%"])
 
 k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Total IB Children", f"{total_children:,}")
-k2.metric("Deposited", f"{total_deposited:,}", help="Clients with Total Deposit > 0")
-k3.metric("Overall Deposit %", f"{overall_deposit_pct}%")
+k1.metric(
+    "Total IB Children", f"{total_children:,}",
+    help="Distinct referred clients in the Broker Referral file — the true total, "
+         "not restricted to only those who also have a row in User_Data.",
+)
+k2.metric(
+    "Deposited", f"{total_deposited:,}",
+    help="Of those, clients with Total Deposit > 0 in User_Data. Can only be counted "
+         "for children who have a matching User_Data row, since that's the only place "
+         "deposit figures exist.",
+)
+k3.metric(
+    "Overall Deposit %", f"{overall_deposit_pct}%",
+    help="Deposited ÷ Total IB Children × 100.",
+)
 k4.metric("Traded (of Deposited)", f"{total_traded:,}")
 k5.metric("Overall Trade %", f"{overall_trade_pct}%")
 
@@ -317,53 +349,11 @@ k8.metric(
 
 st.markdown("")
 total_distinct_brokers = int(brf_filtered["Referrer Client ID"].nunique())
-total_broker_file_referrals = int(brf_filtered["Client Id"].nunique())
-match_rate_pct = round(total_children / total_broker_file_referrals * 100, 2) if total_broker_file_referrals else 0
-
-k9, k10, k11 = st.columns(3)
+k9, _, _, _, _ = st.columns(5)
 k9.metric(
-    "Total Distinct Brokers", f"{total_distinct_brokers:,}",
-    help="Unique Referrer Client IDs in the Broker Referral file itself (after filters) — "
-         "not limited to brokers whose referred children also appear in User_Data.",
+    "Total Brokers", f"{total_distinct_brokers:,}",
+    help="Unique Referrer Client IDs in the Broker Referral file (after filters).",
 )
-k10.metric(
-    "Broker File Referrals", f"{total_broker_file_referrals:,}",
-    help="Unique referred Client IDs logged in the Broker Referral file — this is the "
-         "true total, independent of whether they show up in User_Data.",
-)
-k11.metric(
-    "Matched to User_Data %", f"{match_rate_pct}%",
-    help=f"Total IB Children ÷ Broker File Referrals × 100 — {total_children:,} of "
-         f"{total_broker_file_referrals:,}. This is why 'Total IB Children' above can be "
-         f"much smaller than the broker file's own referral count: only referred clients "
-         f"that also appear in User_Data count as IB Children.",
-)
-
-with st.expander("🩺 Why is Total IB Children so much smaller than the broker file's referral count?"):
-    # Convert to plain strings and drop true nulls before the set difference —
-    # a stray NaN/non-string value mixed in with strings makes sorted() raise
-    # a TypeError ('<' not supported between instances of 'float' and 'str'),
-    # so this is done defensively regardless of what's actually in the data.
-    brf_client_ids = {str(x) for x in brf_filtered["Client Id"].dropna()}
-    merged_client_ids = {str(x) for x in merged_raw["Client Id"].dropna()}
-    unmatched_ids = sorted(brf_client_ids - merged_client_ids)
-    st.write(
-        f"**{total_broker_file_referrals:,}** distinct clients were referred according to the "
-        f"Broker Referral file, but only **{total_children:,}** of them also have a row in "
-        f"User_Data — so **{len(unmatched_ids):,}** referred clients never matched."
-    )
-    st.caption(
-        "If this gap looks too large to be real (e.g. you'd expect most referred clients to "
-        "eventually show up in User_Data), it's worth double-checking these IDs against "
-        "User_Data by hand — a subtle formatting difference (extra characters, a different "
-        "ID scheme) between the two exports would show up exactly like this. Whitespace is "
-        "already stripped from both files' Client Id columns before matching, so that "
-        "specific issue is ruled out."
-    )
-    st.dataframe(
-        pd.DataFrame({"Unmatched Client Id (in Broker Referral file, not in User_Data)": unmatched_ids}).head(50),
-        use_container_width=True, hide_index=True,
-    )
 
 st.divider()
 
